@@ -1,6 +1,10 @@
 name: Auto Scheduler watcher
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "status.json"       # runs the moment you commit a change to status.json
   schedule:
     - cron: "*/5 * * * *"     # every 5 minutes (GitHub may delay a little)
   workflow_dispatch:           # lets you press "Run workflow" to test instantly
