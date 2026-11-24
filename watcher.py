@@ -12,6 +12,13 @@ MY_PHONE   = os.environ.get("MY_PHONE", "")
 STATE_FILE = "alerted.txt"   # remembers we already alerted, so it rings only once
 
 def get_status():
+    # FAST MODE: read status.json straight from the repository copy that
+    # GitHub Actions just downloaded - no waiting for "pages build and deployment".
+    if os.path.exists("status.json"):
+        print("Reading status.json from the repository (fast mode)")
+        with open("status.json") as f:
+            return json.load(f)
+    # Fallback: read it from the live website
     url = f"{SITE_URL}/status.json?t={int(time.time())}"
     with urllib.request.urlopen(url, timeout=20) as r:
         return json.loads(r.read())
