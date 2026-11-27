@@ -1,54 +1,68 @@
-# Auto Scheduler - cloud watcher (runs on GitHub Actions)
-# Checks the ShowTix status file. When bookings open, it sends a push
-# notification (ntfy) and rings your phone (Twilio) - only once per opening.
-import json, os, base64, urllib.request, urllib.parse, time
+# Auto Scheduler - cloud watcher v2 (runs on GitHub Actions)
+# Reads every ACTIVE watch from Firebase, checks its booking page,
+# sends an urgent ntfy alert to that watch's topic when booking opens (once),
+# and updates "lastChecked" so the app shows "Last checked X min ago".
+import json, os, time, re, urllib.request
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-SITE_URL   = os.environ["SITE_URL"].rstrip("/")      # e.g. https://you.github.io/showtix
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
-TW_SID     = os.environ.get("TWILIO_SID", "")
-TW_TOKEN   = os.environ.get("TWILIO_TOKEN", "")
-TW_FROM    = os.environ.get("TWILIO_FROM", "")
-MY_PHONE   = os.environ.get("MY_PHONE", "")
-STATE_FILE = "alerted.txt"   # remembers we already alerted, so it rings only once
+SITE_URL = os.environ.get("SITE_URL", "").rstrip("/")
+key = json.loads(os.environ["FIREBASE_KEY"])
+firebase_admin.initialize_app(credentials.Certificate(key))
+db = firestore.client()
 
-def get_status():
-    # FAST MODE: read status.json straight from the repository copy that
-    # GitHub Actions just downloaded - no waiting for "pages build and deployment".
-    if os.path.exists("status.json"):
-        print("Reading status.json from the repository (fast mode)")
-        with open("status.json") as f:
-            return json.load(f)
-    # Fallback: read it from the live website
-    url = f"{SITE_URL}/status.json?t={int(time.time())}"
-    with urllib.request.urlopen(url, timeout=20) as r:
-        return json.loads(r.read())
+OPEN_WORDS = re.compile(r"bookings? (are )?open|book now|booking started", re.I)
 
-def push(title, msg):
-    if not NTFY_TOPIC: return
-    req = urllib.request.Request(f"https://ntfy.sh/{NTFY_TOPIC}", data=msg.encode(),
-        headers={"Title": title, "Priority": "urgent", "Tags": "rotating_light",
-                 "Click": SITE_URL + "/"})
-    urllib.request.urlopen(req, timeout=20); print("Push sent")
+def fetch(url):
+    sep = "&" if "?" in url else "?"
+    req = urllib.request.Request(f"{url}{sep}t={int(time.time())}", headers={"User-Agent": "AutoScheduler-test/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.read().decode("utf-8", "ignore")
 
-def call(text):
-    if not (TW_SID and TW_TOKEN and TW_FROM and MY_PHONE): return
-    twiml = f'<Response><Say voice="alice">{text}</Say><Pause length="1"/><Say voice="alice">{text}</Say></Response>'
-    data = urllib.parse.urlencode({"To": MY_PHONE, "From": TW_FROM, "Twiml": twiml}).encode()
-    auth = base64.b64encode(f"{TW_SID}:{TW_TOKEN}".encode()).decode()
-    req = urllib.request.Request(f"https://api.twilio.com/2010-04-01/Accounts/{TW_SID}/Calls.json",
-        data=data, headers={"Authorization": "Basic " + auth})
-    urllib.request.urlopen(req, timeout=20); print("Call placed")
+def is_open(link):
+    """True/False, or None if the page could not be checked."""
+    base = link.rstrip("/")
+    # Our ShowTix test site: read status.json (fast: local repo copy if it is this site)
+    if SITE_URL and base.startswith(SITE_URL) and os.path.exists("status.json"):
+        return bool(json.load(open("status.json")).get("open"))
+    try:
+        return bool(json.loads(fetch(base + "/status.json")).get("open"))
+    except Exception:
+        pass
+    try:
+        return bool(OPEN_WORDS.search(fetch(link)))
+    except Exception as e:
+        print("  could not check:", e)
+        return None
 
-s = get_status()
-already = os.path.exists(STATE_FILE)
-print("Status:", s, "| already alerted:", already)
+def push(topic, title, msg, link):
+    req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=msg.encode("utf-8"),
+        headers={"Title": title, "Priority": "urgent", "Tags": "rotating_light", "Click": link or ""})
+    urllib.request.urlopen(req, timeout=20)
 
-if s.get("open") and not already:
-    msg = f'{s["movie"]} bookings are OPEN at {s["theatre"]}, {s["show"]}. Book now!'
-    push("Auto Scheduler: Bookings OPEN", msg)
-    call(f'Auto Scheduler alert. {s["movie"]} bookings are now open at {s["theatre"]}. Open the app to book.')
-    open(STATE_FILE, "w").write(time.strftime("%Y-%m-%d %H:%M UTC"))
-elif not s.get("open") and already:
-    os.remove(STATE_FILE); print("Bookings closed again - reset, ready for next opening")
-else:
-    print("Nothing to do")
+watches = list(db.collection("watches").where("active", "==", True).stream())
+print(f"Active watches: {len(watches)}")
+
+for doc in watches:
+    w = doc.to_dict()
+    name, link, topic = w.get("name", "?"), w.get("link", ""), w.get("topic", "")
+    print(f"- {name} | {link}")
+    if not link or not topic:
+        print("  skipped (no link or no ntfy topic)")
+        continue
+    state = is_open(link)
+    update = {"lastChecked": firestore.SERVER_TIMESTAMP}
+    if state is True and not w.get("alerted"):
+        extra = f" · {w.get('count')} tickets" if w.get("count") else ""
+        pref = f" · prefers {w['pref']}" if w.get("pref") else ""
+        msg = f"{name} at {w.get('place','')} is OPEN{extra}{pref}. Tap to book now!"
+        push(topic, "Auto Scheduler: Booking OPEN", msg, link)
+        update.update({"alerted": True, "openedAt": firestore.SERVER_TIMESTAMP})
+        print("  OPEN -> alert sent")
+    elif state is False and w.get("alerted"):
+        update["alerted"] = False
+        print("  closed again -> reset")
+    else:
+        print("  open (already alerted)" if state else "  not open yet" if state is False else "  check failed")
+    doc.reference.update(update)
+print("Done")
